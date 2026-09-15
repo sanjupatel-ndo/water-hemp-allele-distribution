@@ -9,4 +9,5 @@ and apply the necccesary changes to the dependent environmental data
 Methodology: 
 
 Data requirements:
+    Inputs: Latitude, Longitude
 """
