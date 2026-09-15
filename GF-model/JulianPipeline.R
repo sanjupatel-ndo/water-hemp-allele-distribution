@@ -1,17 +1,15 @@
-"""
-Kreiner Lab - September 14th 2026
-Julian Huang's GF pipeline
-Primary contributor(s): Julian Huang
+#######
+#Kreiner Lab - September 14th 2026
+#Julian Huang's GF pipeline
+#Primary contributor(s): Julian Huang
+#
+#Objective: understand how to create a Gradient Forest model
+#
+#Data requirements:
+#   Inputs: 
+#
 
-Objective: understand how to create a Gradient Forest model
-
-Methodology: 
-
-Data requirements:
-    Inputs: Latitude, Longitude
-"""
-
-# install.packages(c("gradientForest","ggplot2"))  # if needed
+install.packages(c("gradientForest","ggplot2"))  # if needed
 library(gradientForest)
 library(ggplot2)
 
