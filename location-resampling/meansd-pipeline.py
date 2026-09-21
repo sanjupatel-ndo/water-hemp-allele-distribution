@@ -43,7 +43,7 @@ def create_buffers(obs_df: pd.DataFrame, radius: float) -> gpd.GeoDataFrame:
     gdf_utm["uncertainty_buffer"] = gdf_utm.geometry.buffer(gdf_utm["coordinateUncertaintyInMeters"])
     return gdf_utm
 
-gbif_observations_file_path = '..\\1000m_amaranthus_with_proportions.csv'
+gbif_observations_file_path = '1000m_amaranthus_with_proportions.csv'
 df = pd.read_csv(gbif_observations_file_path, sep='\t')
 
 gdf_utm = create_buffers(df, radius=1000)
