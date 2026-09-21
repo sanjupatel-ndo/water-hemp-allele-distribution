@@ -22,7 +22,7 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point, Polygon
 
-def create_buffers(obs_df: pd.DataFrame, radius: float) -> gpd.GeoDataFrame:
+def create_buffers(obs_df: pd.DataFrame) -> gpd.GeoDataFrame:
     """
     Creates 1 km vector buffers around observation points. Assumes observations 
     from GBIF and has 'decimalLongitude' and 'decimalLatitude' keys
@@ -46,5 +46,5 @@ def create_buffers(obs_df: pd.DataFrame, radius: float) -> gpd.GeoDataFrame:
 gbif_observations_file_path = '1000m_amaranthus_with_proportions.csv'
 df = pd.read_csv(gbif_observations_file_path)
 
-gdf_utm = create_buffers(df, radius=1000)
-gdf_utm.head()
+gdf_utm = create_buffers(df)
+print(gdf_utm.head())
