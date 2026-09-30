@@ -34,7 +34,7 @@ def create_buffers(obs_df: pd.DataFrame) -> gpd.GeoDataFrame:
 
     Returns:
         gpd.GeoDataFrame: A GeoDataFrame with original points and their 
-        corresponding 1 km buffers.
+        corresponding rectangles of uncertainty.
     """
     geometry = [Point(lon, lat) for lon, lat in zip(obs_df['decimalLongitude'], obs_df['decimalLatitude'])]
     gdf = gpd.GeoDataFrame(obs_df, geometry=geometry, crs="EPSG:4326")

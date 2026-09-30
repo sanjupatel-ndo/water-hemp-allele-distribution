@@ -53,3 +53,9 @@ def fill_uncertainty(loc_df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+gbif_observations_file_path = '1000m_amaranthus_with_proportions.csv'
+df = pd.read_csv(gbif_observations_file_path)
+
+gdf_utm = fill_uncertainty(df)
+gdf_utm.to_csv(gbif_observations_file_path, index=False)
+print(gdf_utm.head())
