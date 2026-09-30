@@ -47,4 +47,23 @@ gbif_observations_file_path = '1000m_amaranthus_with_proportions.csv'
 df = pd.read_csv(gbif_observations_file_path)
 
 gdf_utm = create_buffers(df)
-print(gdf_utm.head())
+
+#Step 2: Start collecting the environmental data, and sampling if neccesary
+
+def collect_precip_data(a_df: gpd.DataFrame) -> gpd.DataFrame:
+    """
+    For samples with an uncertainty more precise than the available precip.
+    data, pulls appropriate data for the month of sample collection. For samples
+    with greater uncertainty, sample some number of the precipitation values 
+    contained in the raidus of uncertainty.
+    The precision of the precip data is 800m.
+    
+    Args:
+        a_df (gpd.DataFrame): A GeoDataFrame with original points and their 
+                            corresponding rectangles of uncertainty.
+
+    Returns:
+        gpd.GeoDataFrame: Same data frame but with monthly precitipation data
+    """
+    precip_precis = 800
+    
