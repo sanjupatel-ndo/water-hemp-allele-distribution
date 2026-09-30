@@ -1,6 +1,6 @@
 """
-Kreiner Lab - September 14th 2026
-Resampling pipeline
+Kreiner Lab - September 21th 2026
+Location uncertainty cleaning pipeline
 Primary contributor(s): Sanju Patel
 
 Objective: Report a location uncertainty for every sample. Additionally,
