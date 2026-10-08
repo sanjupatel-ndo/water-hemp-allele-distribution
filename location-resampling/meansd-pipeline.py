@@ -21,6 +21,7 @@ Data requirements:
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point, Polygon
+from typing import Optional
 
 def create_buffers(obs_df: pd.DataFrame) -> gpd.GeoDataFrame:
     """
@@ -46,148 +47,231 @@ def create_buffers(obs_df: pd.DataFrame) -> gpd.GeoDataFrame:
 
 #Step 2: Start collecting the environmental data, and sampling if neccesary
 
-import io
-import re
+import shutil
+import time
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import rasterio
-from rasterio.io import MemoryFile
+import requests
 from rasterio.mask import mask as rio_mask
-from googleapiclient.http import MediaIoBaseDownload
+from tqdm import tqdm
+ 
+PRECIP_PRECIS_M = 800          # native PRISM 800m precision
+PRISM_BASE = "https://services.nacse.org/prism/data/get"
+RASTER_EXT = (".tif", ".bil")
+ALL_VARIABLES = ["ppt", "tmin", "tmax", "tmean", "tdmean", "vpdmin", "vpdmax"]
+ 
+ 
+# --------------------------------------------------------------------------
+# Download
+# --------------------------------------------------------------------------
+def fetch_month_raster(
+    yyyymm: str,
+    element: str,
+    cache_dir: str = "prism_cache",
+    region: str = "us",
+    res: str = "800m",
+    pause: float = 2.0,
+    retries: int = 4,
+) -> Optional[Path]:
+    """
+    Download one monthly PRISM grid package and extract it. Returns the raster
+    path, or None if PRISM has no grid for that month/variable. If the grid is
+    already extracted in cache_dir, no request is made.
+    """
+    folder = Path(cache_dir) / f"{element}_{region}_{res}_{yyyymm}"
+    if folder.exists():
+        existing = [p for p in folder.glob("*") if p.suffix.lower() in RASTER_EXT]
+        if existing:
+            return existing[0]
+ 
+    url = f"{PRISM_BASE}/{region}/{res}/{element}/{yyyymm}"
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, timeout=180)
+        except requests.RequestException as e:
+            tqdm.write(f"  {element} {yyyymm}: request error ({e}); retry {attempt + 1}/{retries}")
+            time.sleep(2 ** attempt)
+            continue
 
-PRECIP_PRECIS_M = 800   # native PRISM precision
-RES_TAG = "30s"         # tag for weather data with 800m precision
+        if r.status_code == 200:
+            folder.mkdir(parents=True, exist_ok=True)
+            zpath = folder / f"{element}_{yyyymm}.zip"
+            zpath.write_bytes(r.content)
+            if not zipfile.is_zipfile(zpath):
+                tqdm.write(f"  {element} {yyyymm}: response was not a zip (likely no grid available)")
+                zpath.unlink()
+                folder.rmdir()
+                return None
+            with zipfile.ZipFile(zpath) as zf:
+                zf.extractall(folder)   # extract all so .bil/.hdr/.prj stay together
+            zpath.unlink()
+            time.sleep(pause)           # be polite to the server
+            found = [p for p in folder.glob("*") if p.suffix.lower() in RASTER_EXT]
+            return found[0] if found else None
 
-def build_zip_index(drive, folder_id: str) -> dict:
-    """Map 'YYYYMM' -> list of Drive file dicts, using filenames only."""
-    index, token = {}, None
-    while True:
-        resp = drive.files().list(
-            q=f"'{folder_id}' in parents and name contains '.zip' and trashed=false",
-            fields="nextPageToken, files(id, name)",
-            pageSize=1000, pageToken=token,
-        ).execute()
-        for f in resp["files"]:
-            m = re.search(r"_(\d{6})(?:_|\.)", f["name"])
-            if m:
-                index.setdefault(m.group(1), []).append(f)
-        token = resp.get("nextPageToken")
-        if not token:
-            return index
+        if r.status_code in (400, 404):
+            tqdm.write(f"  {element} {yyyymm}: PRISM has no grid (HTTP {r.status_code})")
+            return None
 
-
-def _download_bytes(drive, file_id: str) -> bytes:
-    buf = io.BytesIO()
-    dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=file_id),
-                             chunksize=8 * 1024 * 1024)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    return buf.getvalue()
-
-
-def _pick_file(candidates: list, res_tag: str) -> dict:
-    matches = [f for f in candidates if res_tag in f["name"]]
-    return (matches or candidates)[0]
-
-
-def collect_precip_data(
+        tqdm.write(f"  {element} {yyyymm}: HTTP {r.status_code}; retry {attempt + 1}/{retries}")
+        time.sleep(2 ** attempt)
+ 
+    return None
+ 
+ 
+# --------------------------------------------------------------------------
+# Extraction
+# --------------------------------------------------------------------------
+def _cells_in_circle(src, circle) -> np.ndarray:
+    """
+    Valid raster values inside a circular uncertainty polygon. Uses cells whose
+    center falls inside the circle first; falls back to every touched cell if
+    no centers fall inside.
+    """
+    for all_touched in (False, True):
+        try:
+            arr, _ = rio_mask(src, [circle], crop=True, all_touched=all_touched, filled=False)
+        except ValueError:   # circle doesn't overlap the grid
+            return np.array([])
+        vals = arr[0].compressed()
+        if vals.size > 0:
+            return vals
+    return np.array([])
+ 
+ 
+def _extract_value(src, pt, circle, precise, n_samples, rng):
+    """Return (mean, std, n_cells, method) for one sample, or None."""
+    if precise:
+        val = next(src.sample([(pt.x, pt.y)], masked=True))[0]
+        if np.ma.is_masked(val):
+            return None
+        return float(val), np.nan, 1, "point"
+ 
+    if circle is None or circle.is_empty:
+        return None
+    vals = _cells_in_circle(src, circle)
+    if vals.size == 0:
+        return None
+    if n_samples is not None and vals.size > n_samples:
+        vals = rng.choice(vals, size=n_samples, replace=False)
+    return float(vals.mean()), float(vals.std()), int(vals.size), "area"
+ 
+ 
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+def collect_prism_data(
     a_df: gpd.GeoDataFrame,
-    drive,
-    index: dict,
-    date_col: str = "eventDate",
+    variables: list[str] = ALL_VARIABLES,
+    year_col: str = "year",
+    month_col: str = "month",
     point_col: str = "geometry",
-    rect_col: str = "uncertainty_buffer",
+    circle_col: str = "uncertainty_buffer",
     uncertainty_col: str = "coordinateUncertaintyInMeters",
-    n_samples: int = 30,
+    n_samples: Optional[int] = None,
     seed: int = 0,
+    res: str = "800m",
+    cache_dir: str = "prism_cache",
+    checkpoint_dir: str = "prism_checkpoints",
+    keep_grids: bool = False,
 ) -> gpd.GeoDataFrame:
     """
-    For samples with an uncertainty more precise than the available precip.
-    data, pulls appropriate data for the month of sample collection. For samples
-    with greater uncertainty, sample some number of the precipitation values
-    contained in the radius of uncertainty.
-    The precision of the precip data is 800m.
-
-    Args:
-        a_df (gpd.GeoDataFrame): A GeoDataFrame with original points and their
-                            corresponding rectangles of uncertainty.
-        drive: authenticated Google Drive v3 service.
-        index: output of build_zip_index() for the 'monthly' folder.
-        date_col: collection date column (datetime-like).
-        point_col: column holding the original point geometry.
-        rect_col: column holding the uncertainty rectangle geometry.
-        uncertainty_col: uncertainty in meters.
-        n_samples: max number of cells to sample for high-uncertainty samples.
-        seed: RNG seed so sampling is reproducible.
-
-    Returns:
-        gpd.GeoDataFrame: Same data frame but with monthly precipitation data
-            (ppt_mm, ppt_std_mm, ppt_n_cells, ppt_method).
+    Match monthly PRISM variables to samples by location and collection month.
+ 
+    Loops months on the outside and variables on the inside, so each grid
+    (month x variable) is downloaded exactly once. After a month is finished,
+    its results are written to a checkpoint file and (unless keep_grids=True)
+    its grids are deleted. Rerunning skips any month that already has a
+    checkpoint, so an interrupted run resumes where it left off.
+ 
+    Samples with uncertainty <= 800 m get the value of the cell containing the
+    point. Samples with greater uncertainty get the mean (and std) of the cells
+    inside their uncertainty circle (all cells if n_samples is None, otherwise
+    a random subset of n_samples).
+ 
+    Output columns, per variable v: v, v_std. Shared: prism_n_cells,
+    prism_method.
     """
     rng = np.random.default_rng(seed)
     df = a_df.copy()
-    df["_yyyymm"] = pd.to_datetime(df[date_col]).dt.strftime("%Y%m")
+ 
+    # YYYYMM key from separate year / month columns; NA if either is missing
+    yy = pd.to_numeric(df[year_col], errors="coerce").astype("Int64").astype("string")
+    mm = pd.to_numeric(df[month_col], errors="coerce").astype("Int64").astype("string").str.zfill(2)
+    df["_yyyymm"] = yy + mm
+    n_bad = df["_yyyymm"].isna().sum()
+    if n_bad:
+        print(f"{n_bad} samples have a missing year or month and will be left as NaN")
+ 
+    ckpt = Path(checkpoint_dir) / (f"{res}_" + "_".join(variables))
+    ckpt.mkdir(parents=True, exist_ok=True)
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+ 
+    months = sorted(df["_yyyymm"].dropna().unique())
+    frames = []
 
-    df["ppt_mm"] = np.nan
-    df["ppt_std_mm"] = np.nan
-    df["ppt_n_cells"] = 0
-    df["ppt_method"] = None
-
-    for yyyymm, group in df.groupby("_yyyymm"):
-        if yyyymm not in index:
-            print(f"No PRISM zip found for {yyyymm}; {len(group)} samples left as NaN")
+    for yyyymm in tqdm(months, desc="months", unit="month"):
+        ckpt_file = ckpt / f"{yyyymm}.csv"
+        if ckpt_file.exists():
+            frames.append(pd.read_csv(ckpt_file, index_col=0))
             continue
 
-        # one download + one open per month
-        f = _pick_file(index[yyyymm], RES_TAG)
-        with zipfile.ZipFile(io.BytesIO(_download_bytes(drive, f["id"]))) as zf:
-            tif = next(n for n in zf.namelist() if n.lower().endswith(".tif"))
-            tif_bytes = zf.read(tif)
+        group = df[df["_yyyymm"] == yyyymm]
+        tqdm.write(f"{yyyymm}: {len(group)} samples")
+        out = pd.DataFrame(index=group.index)
+        for v in variables:
+            out[v] = np.nan
+            out[f"{v}_std"] = np.nan
+        out["prism_n_cells"] = 0
+        out["prism_method"] = None
 
-        with MemoryFile(tif_bytes) as mem, mem.open() as src:
-            # put geometries into the raster's CRS once per month
-            pts = gpd.GeoSeries(group[point_col], crs=df.crs).to_crs(src.crs)
-            rects = gpd.GeoSeries(group[rect_col], crs=df.crs).to_crs(src.crs)
-
-            for idx, pt, rect in zip(group.index, pts, rects):
-                precise = df.at[idx, uncertainty_col] <= PRECIP_PRECIS_M
-
-                if precise:
-                    val = next(src.sample([(pt.x, pt.y)], masked=True))[0]
-                    if np.ma.is_masked(val):
+        for v in tqdm(variables, desc=yyyymm, leave=False, unit="var"):
+            raster_path = fetch_month_raster(yyyymm, v, cache_dir=cache_dir, res=res)
+            if raster_path is None:
+                continue
+ 
+            with rasterio.open(raster_path) as src:
+                # put geometries into the raster's CRS once per grid
+                pts = gpd.GeoSeries(group[point_col], crs=df.crs).to_crs(src.crs)
+                circles = gpd.GeoSeries(group[circle_col], crs=df.crs).to_crs(src.crs)
+ 
+                for idx, pt, circle in zip(group.index, pts, circles):
+                    unc = df.at[idx, uncertainty_col]
+                    precise = pd.notna(unc) and unc <= PRECIP_PRECIS_M
+                    res_tuple = _extract_value(src, pt, circle, precise, n_samples, rng)
+                    if res_tuple is None:
                         continue
-                    df.loc[idx, ["ppt_mm", "ppt_std_mm", "ppt_n_cells", "ppt_method"]] = \
-                        [float(val), np.nan, 1, "point"]
-                else:
-                    arr, _ = rio_mask(src, [rect], crop=True, all_touched=True, filled=False)
-                    vals = arr[0].compressed()   # drops nodata / outside-mask cells
-                    if vals.size == 0:
-                        continue
-                    if vals.size > n_samples:
-                        vals = rng.choice(vals, size=n_samples, replace=False)
-                    df.loc[idx, ["ppt_mm", "ppt_std_mm", "ppt_n_cells", "ppt_method"]] = \
-                        [float(vals.mean()), float(vals.std()), int(vals.size), "area"]
-
+                    mean, std, n, method = res_tuple
+                    out.at[idx, v] = mean
+                    out.at[idx, f"{v}_std"] = std
+                    if out.at[idx, "prism_n_cells"] == 0:
+                        out.at[idx, "prism_n_cells"] = n
+                        out.at[idx, "prism_method"] = method
+ 
+            if not keep_grids:
+                shutil.rmtree(raster_path.parent, ignore_errors=True)
+ 
+        out.to_csv(ckpt_file)    # checkpoint: this month is done
+        frames.append(out)
+ 
+    if frames:
+        results = pd.concat(frames)
+        df = df.join(results)
     return df.drop(columns="_yyyymm")
-    
-
+ 
+ 
 if __name__ == "__main__":
-    df = pd.read_csv("1000m_amaranthus_with_proportions.csv")
+    df = pd.read_csv("herbarium_metadata_2022_2026_datasets.csv")
     gdf = create_buffers(df)
-
-    # setup drive auth (see above)
-    PRISM_FOLDER_ID = "your_folder_id_here"
-    index = build_zip_index(drive, PRISM_FOLDER_ID)
-
-    result = collect_precip_data(
+ 
+    result = collect_prism_data(
         gdf,
-        drive,
-        index,
-        date_col="eventDate",
+        variables=ALL_VARIABLES,
+        year_col="year",
+        month_col="month",
         uncertainty_col="coordinateUncertaintyInMeters",
     )
-    result.drop(columns="geometry").to_csv("output_with_precip.csv", index=False)
-
-
+    result.drop(columns=["geometry", "uncertainty_buffer"]).to_csv("herbarium_samples_2022_2026_withPRISMvars.csv", index=False)
