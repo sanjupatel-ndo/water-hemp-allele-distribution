@@ -260,7 +260,38 @@ def collect_prism_data(
     if frames:
         results = pd.concat(frames)
         df = df.join(results)
+
+    _report_coverage(df, variables)
     return df.drop(columns="_yyyymm")
+
+
+def _report_coverage(df: pd.DataFrame, variables: list[str]) -> None:
+    """
+    Print how many samples ended up without environmental data, split by cause:
+    a missing collection year/month (so no grid could be looked up) vs. PRISM
+    having no usable value at that location/month.
+    """
+    total = len(df)
+    no_date = df["_yyyymm"].isna()
+
+    present = [v for v in variables if v in df.columns]
+    if present:
+        no_values = df[present].isna().all(axis=1)
+        partial = df[present].isna().any(axis=1) & ~no_values
+    else:   # nothing was ever joined on, so no sample has data
+        no_values = pd.Series(True, index=df.index)
+        partial = pd.Series(False, index=df.index)
+
+    no_prism = no_values & ~no_date       # had a date, PRISM still gave nothing
+    missing = no_values                   # no data at all, for either reason
+
+    print("\n--- PRISM coverage ---")
+    print(f"total samples:                        {total}")
+    print(f"no data (any reason):                 {missing.sum()}")
+    print(f"  - missing year/month:               {no_date.sum()}")
+    print(f"  - no PRISM value at location/month: {no_prism.sum()}")
+    print(f"partial data (some variables only):   {partial.sum()}")
+    print(f"complete data:                        {total - missing.sum() - partial.sum()}")
  
  
 if __name__ == "__main__":
