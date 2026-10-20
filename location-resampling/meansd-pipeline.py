@@ -7,13 +7,12 @@ Objective: Pull environmental data for samples with varying degrees of location
 uncertainty
 
 Methodology: For each sample, draw a circle where the sample may have been
-collected. For each environmental variable, randomly sample some number of 
-observations within this radius. For this first pass, report the mean and 
-standard deviation of the sampling distribution for each environmental variable, 
-for each sample.
+collected. For each PRISM variable, sample all of the observations within this 
+radius. For this first pass, report the mean and standard deviation of the 
+sampling distribution for each environmental variable, for each sample.
 
 Data requirements:
-    Inputs: Waterhemp sample with a latitude and longtitude
+    Inputs: Waterhemp sample with a latitude and longtitude, uncertainty radius
 """
 #Step 1: For each sample, create an area that represents where the sample was
 #collected, taking into account differing levels of location uncertainty.
