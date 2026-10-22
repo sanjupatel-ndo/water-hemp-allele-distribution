@@ -17,22 +17,12 @@ lat_precision_m / lon_precision_m (that grid step in metres) to the herbarium
 metadata table. The rounding uncertainty of a coordinate is half its grid step,
 since the true value lies within half a step of what was written.
 
-Scope: this is the ROUNDING component of location uncertainty only, and it is a
-floor rather than a total. Georeferencing error -- how vague the original
-locality text was, and whether the coordinate is a gazetteer centroid -- is
-usually the larger term and is not handled here.
-
 Data requirements:
     Inputs: coordinates read as STRINGS, not floats. Parsing to float first
             discards written precision, so read_csv is given dtype=str for the
             two coordinate columns.
 
-Known caveat: a CSV that has already been read into pandas and written back out
-has lost trailing zeros (34.950000 becomes 34.95), because to_csv emits the
-shortest round-tripping representation. Grid detection tolerates this -- it
-reads such a value as sitting on the 0.01 degree grid, which is the correct
-conservative reading -- but written precision is understated for those records.
-Where the original accession files are available, run this on those instead.
+Note run this pipeline on fresh data so it can process trailing zeros
 """
 
 import math
