@@ -6,10 +6,15 @@ Primary contributor(s): Sanju Patel
 Objective: Pull land use data for samples with varying degrees of location
 uncertainty.
 
-Methodology: For each sample, take the area where it may have been collected
-and read every HILDA+ land use/cover cell whose centre falls inside that area.
-Report the class composition of those cells, point composition, and a shannon
-index for the diversity of land uses.
+Methodology: For each sample, read every HILDA+ land use/cover cell whose
+centre falls within 5 km of the recorded coordinate, or within the sample's own
+location uncertainty where that is wider. Report the class composition of those
+cells, point composition, and a shannon index for the diversity of land uses.
+
+The 5 km floor is a sampling choice, not an uncertainty claim: at 0.01 degree
+resolution a tight radius returns one or two cells, too few to describe a
+composition, while 5 km gives 80-90. The radius used is reported per sample in
+hilda_radius_m and hilda_radius_source.
 
 HILDA+ covers 1899-2019 annually and globally, so it reaches the pre-NLCD
 records and the Ontario samples. The cost is resolution: cells are 0.01 degrees,
@@ -19,7 +24,7 @@ Data requirements:
     Inputs: Waterhemp samples with a latitude, longitude, collection year, and
             a location uncertainty radius. Radius is taken from the coordinate
             precision columns written by coordinate_precision.py, or from an
-            explicit column.
+            explicit column, and is then raised to the 5 km sampling floor.
     Grids:  hildap_vGLOB-1.0-f_netcdf/hildaplus_GLOB-1-0-f_states.nc (2.7 GB).
 """
 
@@ -34,9 +39,6 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# --------------------------------------------------------------------------
-# HILDA+ grid and class definitions
-# --------------------------------------------------------------------------
 HILDA_STATES = "hildap_vGLOB-1.0-f_netcdf/hildaplus_GLOB-1-0-f_states.nc"
 
 # Clean global 0.01 degree raster, 18000 x 36000. The metadata .txt shipped with
@@ -49,6 +51,10 @@ LAT_TOP, LON_LEFT = 90.0, -180.0
 M_PER_DEG = 111_320.0
 
 HILDA_YEAR_MIN, HILDA_YEAR_MAX = 1899, 2019
+
+# Radius floor applied to every sample; those with a larger location
+# uncertainty are read over that instead.
+SAMPLING_RADIUS_M = 5_000.0
 
 # Forest subclasses 41-45 collapse into one Forest class: the HILDA+ docs state
 # the subdivision is static (carried from ESA-CCI 1992) before 1992 and
@@ -72,15 +78,11 @@ AGRICULTURAL_CLASSES = ["Cropland", "Pasture"]
 # no-data are coded 0. Both are treated as missing.
 NODATA_CODES = (0, 99)
 
-# Below this cell count the Shannon index is returned as NaN. A meaningful index
-# wants on the order of 25+ cells, i.e. a radius of about 3 km at this
-# resolution, so treat low-cell results with suspicion even above the default.
+# Below this cell count the Shannon index is returned as NaN. The 5 km floor
+# clears it for any sample on land, so it only bites on mostly-ocean circles.
 MIN_CELLS_FOR_SHANNON = 2
 
 
-# --------------------------------------------------------------------------
-# Grid indexing
-# --------------------------------------------------------------------------
 def cell_index(lat: float, lon: float) -> tuple[int, int]:
     """Convert a coordinate to its HILDA+ (row, col) cell index, clamped."""
     row = int(math.floor((LAT_TOP - lat) / CELL_DEG))
@@ -91,18 +93,11 @@ def cell_index(lat: float, lon: float) -> tuple[int, int]:
 def resolve_radius(
     df: pd.DataFrame,
     radius_col: Optional[str] = None,
-    min_radius_m: float = 0.0,
+    min_radius_m: float = SAMPLING_RADIUS_M,
 ) -> pd.Series:
     """
-    Decide the uncertainty radius, in metres, to use for each sample.
-
-    Args:
-        df (pd.DataFrame): Sample table.
-        radius_col (Optional[str]): Explicit radius column, in metres.
-        min_radius_m (float): Lower bound applied to every radius.
-
-    Returns:
-        pd.Series: Radius in metres, indexed like df.
+    Sampling radius in metres per sample: location uncertainty raised to
+    min_radius_m. Pass min_radius_m=0.0 to use the uncertainty alone.
     """
     if radius_col is not None:
         radius = pd.to_numeric(df[radius_col], errors="coerce")
@@ -125,9 +120,6 @@ def resolve_radius(
     return radius.fillna(0.0).clip(lower=min_radius_m)
 
 
-# --------------------------------------------------------------------------
-# Extraction
-# --------------------------------------------------------------------------
 def _cells_in_circle(
     window: np.ndarray,
     win_row0: int,
@@ -137,23 +129,14 @@ def _cells_in_circle(
     radius_m: float,
 ) -> np.ndarray:
     """
-    Land use codes for cells whose centres lie within radius_m of a point.
+    Class codes (nodata not yet removed) for cells of one year's window whose
+    centres lie within radius_m of a point. win_row0/win_col0 are the window's
+    offset into the full grid.
 
     Distances are computed in index space with a cos(latitude) correction; at
     these radii the flat-earth approximation is well inside the 1 km cell size.
-    A sub-cell radius leaves no centre inside, and falls back to the single cell
-    containing the point.
-
-    Args:
-        window (np.ndarray): Land use codes for one year, as a 2D sub-grid.
-        win_row0 (int): Grid row index of window row 0.
-        win_col0 (int): Grid column index of window column 0.
-        lat (float): Sample latitude.
-        lon (float): Sample longitude.
-        radius_m (float): Uncertainty radius in metres.
-
-    Returns:
-        np.ndarray: 1D array of class codes, nodata not yet removed.
+    A sub-cell radius leaves no centre inside and falls back to the single cell
+    containing the point, which cannot happen under the default floor.
     """
     row, col = cell_index(lat, lon)
     m_per_deg_lon = M_PER_DEG * math.cos(math.radians(lat))
@@ -184,15 +167,8 @@ def _cells_in_circle(
 
 def _composition(codes: np.ndarray, min_cells_for_shannon: int) -> Optional[dict]:
     """
-    Turn a set of class codes into percentages, a majority class, and a Shannon
-    index.
-
-    Args:
-        codes (np.ndarray): Raw HILDA+ class codes, including any nodata.
-        min_cells_for_shannon (int): Below this cell count, shannon is NaN.
-
-    Returns:
-        Optional[dict]: Composition columns, or None if every cell was nodata.
+    Turn raw class codes into percentages, a majority class, and a Shannon
+    index. None if every cell was nodata.
     """
     valid = codes[~np.isin(codes, NODATA_CODES)]
     if valid.size == 0:
@@ -215,16 +191,14 @@ def _composition(codes: np.ndarray, min_cells_for_shannon: int) -> Optional[dict
         shares.get(cls, 0.0) for cls in AGRICULTURAL_CLASSES) * 100.0
     out["hilda_majority_class"] = counts.idxmax()
     out["hilda_n_cells"] = int(total)
+    # + 0.0 turns the -0.0 of a single-class circle into 0.0.
     out["hilda_shannon"] = (
-        float(-(shares * np.log(shares)).sum())
+        float(-(shares * np.log(shares)).sum()) + 0.0
         if total >= min_cells_for_shannon else np.nan
     )
     return out
 
 
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
 def collect_hilda_data(
     df: pd.DataFrame,
     states_path: str | Path = HILDA_STATES,
@@ -232,36 +206,20 @@ def collect_hilda_data(
     lat_col: str = "decimalLatitude",
     lon_col: str = "decimalLongitude",
     radius_col: Optional[str] = None,
-    min_radius_m: float = 0.0,
+    min_radius_m: float = SAMPLING_RADIUS_M,
     min_cells_for_shannon: int = MIN_CELLS_FOR_SHANNON,
     checkpoint_dir: str = "hilda_checkpoints",
 ) -> pd.DataFrame:
     """
     Match annual HILDA+ land use/cover to samples by location and collection
-    year.
+    year, reading each over a circle of max(location uncertainty, min_radius_m).
+    Returns a copy of df with the composition columns joined on.
 
     Loops years on the outside, reading one window per year that covers all of
     that year's samples, so each year is decompressed once. Finished years are
-    checkpointed and an interrupted run resumes.
-
-    Only years present in the sample table are read. Samples collected outside
-    1899-2019 are left as NaN rather than being filled from the nearest
-    available year.
-
-    Args:
-        df (pd.DataFrame): Sample table with coordinates, year, and a radius
-                           source (see resolve_radius).
-        states_path (str | Path): Path to the HILDA+ LULC states netCDF.
-        year_col (str): Collection year column.
-        lat_col (str): Latitude column.
-        lon_col (str): Longitude column.
-        radius_col (Optional[str]): Explicit radius column, in metres.
-        min_radius_m (float): Lower bound on the uncertainty radius.
-        min_cells_for_shannon (int): Below this cell count, shannon is NaN.
-        checkpoint_dir (str): Directory for per-year checkpoint files.
-
-    Returns:
-        pd.DataFrame: Copy of df with HILDA+ composition columns joined on.
+    checkpointed and an interrupted run resumes. Only years present in the
+    sample table are read, and samples collected outside 1899-2019 are left as
+    NaN rather than filled from the nearest available year.
     """
     states_path = Path(states_path)
     if not states_path.exists():
@@ -274,19 +232,12 @@ def collect_hilda_data(
     radius = resolve_radius(work, radius_col, min_radius_m)
 
     has_input = lat.notna() & lon.notna() & year.notna()
-    if (~has_input).any():
-        print(f"{int((~has_input).sum())} samples lack a coordinate or year and "
-              "will be left as NaN")
-
     in_range = year.between(HILDA_YEAR_MIN, HILDA_YEAR_MAX)
-    n_outside = int((has_input & ~in_range).sum())
-    if n_outside:
-        print(f"{n_outside} samples were collected outside HILDA+ coverage "
-              f"({HILDA_YEAR_MIN}-{HILDA_YEAR_MAX}) and will be left as NaN")
-
     usable = has_input & in_range
 
-    ckpt = Path(checkpoint_dir)
+    # Checkpoints are only valid for the radius floor they were written under,
+    # so they are kept per floor rather than silently reused after a change.
+    ckpt = Path(checkpoint_dir) / f"floor_{int(round(min_radius_m))}m"
     ckpt.mkdir(parents=True, exist_ok=True)
 
     frames = []
@@ -305,8 +256,7 @@ def collect_hilda_data(
             glat, glon, grad = lat[group], lon[group], radius[group]
 
             # Window covering every sample this year, padded by the largest
-            # radius among them. The longitude pad uses whichever latitude in
-            # the group is furthest from the equator, the worst case.
+            # radius and the group's latitude furthest from the equator.
             max_r = float(grad.max())
             worst_lat = max(abs(float(glat.min())), abs(float(glat.max())))
             pad_lat = max_r / M_PER_DEG + CELL_DEG
@@ -320,8 +270,6 @@ def collect_hilda_data(
             c0, c1 = c_left, min(c_right + 1, N_COLS)
 
             window = grid[int(yr) - HILDA_YEAR_MIN, r0:r1, c0:c1]
-            tqdm.write(f"{int(yr)}: {len(group)} samples, "
-                       f"window {window.shape[0]}x{window.shape[1]} cells")
 
             rows = {}
             for idx in group:
@@ -335,7 +283,10 @@ def collect_hilda_data(
                 prow, pcol = cell_index(float(lat[idx]), float(lon[idx]))
                 point_code = int(window[prow - r0, pcol - c0])
                 comp["hilda_point_class"] = HILDA_CLASSES.get(point_code)
-                comp["hilda_method"] = "point" if comp["hilda_n_cells"] == 1 else "area"
+                comp["hilda_radius_m"] = float(radius[idx])
+                comp["hilda_radius_source"] = (
+                    "uncertainty" if float(radius[idx]) > min_radius_m else "floor"
+                )
                 rows[idx] = comp
 
             out = pd.DataFrame.from_dict(rows, orient="index")
@@ -355,7 +306,6 @@ def _report_coverage(
     in_range: pd.Series,
 ) -> None:
     """Print how many samples got land use data, and why the rest did not."""
-    total = len(df)
     have = df["pct_agricultural"].notna() if "pct_agricultural" in df else pd.Series(
         False, index=df.index)
     no_input = ~has_input
@@ -363,25 +313,23 @@ def _report_coverage(
     no_value = ~have & has_input & in_range
 
     print("\n--- HILDA+ coverage ---")
-    print(f"total samples:                     {total}")
-    print(f"land use assigned:                 {int(have.sum())}")
-    print(f"  of which point lookups:          "
-          f"{int((df.get('hilda_method') == 'point').sum())}")
-    print(f"  of which area composites:        "
-          f"{int((df.get('hilda_method') == 'area').sum())}")
-    print(f"no data:                           "
+    print(f"total samples:                   {len(df)}")
+    print(f"land use assigned:               {int(have.sum())}")
+    print(f"no data:                         "
           f"{int((no_input | outside | no_value).sum())}")
-    print(f"  - missing coordinate or year:    {int(no_input.sum())}")
+    print(f"  - missing coordinate or year:  {int(no_input.sum())}")
     print(f"  - collected outside "
-          f"{HILDA_YEAR_MIN}-{HILDA_YEAR_MAX}:   {int(outside.sum())}")
-    print(f"  - all cells ocean/no-data:       {int(no_value.sum())}")
-    if "hilda_shannon" in df:
-        print(f"shannon index computed:            {int(df['hilda_shannon'].notna().sum())}"
-              f"  (NaN where < {MIN_CELLS_FOR_SHANNON} cells)")
+          f"{HILDA_YEAR_MIN}-{HILDA_YEAR_MAX}: {int(outside.sum())}")
+    print(f"  - all cells ocean/no-data:     {int(no_value.sum())}")
     if "hilda_n_cells" in df:
         n = pd.to_numeric(df["hilda_n_cells"], errors="coerce")
-        print(f"cells per sample:                  median {n.median():.0f}, "
-              f"max {n.max():.0f}")
+        print(f"cells per sample:                median {n.median():.0f}, "
+              f"min {n.min():.0f}, max {n.max():.0f}")
+    if "hilda_radius_m" in df:
+        r = pd.to_numeric(df["hilda_radius_m"], errors="coerce") / 1000.0
+        above = int((df["hilda_radius_source"] == "uncertainty").sum())
+        print(f"radius per sample (km):          median {r.median():.1f}, "
+              f"max {r.max():.1f} ({above} above the floor)")
 
 
 if __name__ == "__main__":
@@ -394,6 +342,4 @@ if __name__ == "__main__":
         lon_col="decimalLongitude",
     )
     result.to_csv("herbarium_samples_withHILDA.csv", index=False)
-    print("\nWrote herbarium_samples_withHILDA.csv")
-    print("NOTE: check hilda_n_cells before using hilda_shannon, and do not "
-          "compare it against a 30 m NLCD index.")
+
