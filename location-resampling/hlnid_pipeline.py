@@ -1,43 +1,37 @@
 """
-Kreiner Lab - November 3rd 2026
+Kreiner Lab - November 4th 2026
 Land use pipeline (HLNID)
 Primary contributor(s): Sanju Patel
 
-Objective: Pull land use / land cover and crop type for samples with varying
-degrees of location uncertainty, at a resolution that resolves individual crops.
+Objective: Pull land use / land cover and crop type for samples at the finest
+location precision each sample supports.
 
-Methodology: Mirrors land_use_pipeline.py. For each sample, read every HLNID
-LULC cell whose centre falls within 5 km of the recorded coordinate, or within
-the sample's own location uncertainty where that is wider. Report the class
-composition of those cells, the point class, and a Shannon index for the
-diversity of land uses.
+Methodology: For each sample, read every HLNID LULC cell whose centre falls
+within the sample's own location uncertainty, and report the class composition
+of those cells plus the class at the point itself. No radius floor is applied:
+where the uncertainty is smaller than a cell, the result is the single cell
+containing the coordinate. HLNID_n_cells says which case a row is.
 
-The 5 km floor is a sampling choice, not an uncertainty claim: at 48 arc-sec a
-tight radius returns one or two cells, too few to describe a composition, while
-5 km gives 45-50. The radius used is reported per sample in hlnid_radius_m and
-hlnid_radius_source.
-
-HLNID against HILDA+: HLNID separates the crops waterhemp actually grows in
-(Corn, Soybean, Small grains, Alfalfa, Non-alfalfa hay, Other crop) where HILDA+
-collapses all of them into one Cropland class, and it resolves developed land
-into four intensities. The cost is coverage: HLNID is conterminous US only and
-starts in 1938, so the Ontario samples and the pre-1938 records that HILDA+
-reaches are left as NaN here. Run both and treat them as complementary.
+HLNID against HILDA+: HLNID separates the crops waterhemp grows in (Corn,
+Soybean, Small grains, Alfalfa, Non-alfalfa hay, Other crop) where HILDA+
+collapses them into one Cropland class, and splits developed land into four
+intensities. The cost is coverage: HLNID is conterminous US only and starts in
+1938, so Ontario and pre-1938 samples are NaN here. The two are complementary.
 
 Classes are reported under their exact HLNID names, with no grouping into
-agricultural and non-agricultural -- the crop classes are the point of the
-dataset, and any grouping is better done downstream where it can be seen.
+agricultural and non-agricultural.
 
 Data requirements:
-    Inputs: Waterhemp samples with a latitude, longitude, collection year, and
-            a location uncertainty radius. Radius is taken from the coordinate
-            precision columns written by coordinate_precision.py, or from an
-            explicit column, and is then raised to the 5 km sampling floor.
-    Grids:  HLNID_48sec/lulc/vegtype_YYYY.tif, 1938-2020, from
-            https://doi.org/10.5061/dryad.r4xgxd2rh (CC0). Download
+    Inputs: Samples with latitude, longitude, collection year, and a location
+            uncertainty radius. Radius comes from the coordinate precision
+            columns written by coordinate_precision.py, or from an explicit
+            column.
+    Grids:  HLNID_48sec_20260406/lulc/CONUS_vegtype_YYYY_48sec.tif, 1938-2020,
+            from https://doi.org/10.5061/dryad.r4xgxd2rh (CC0). Download
             HLNID_48sec_20260406.zip (682 MB) and unzip it beside this script.
-            The 150 arc-sec release works too -- point lulc_dir at it -- but its
-            4.6 km cells put only 3-4 cells in a 5 km circle.
+            The 150 arc-sec release also works -- point lulc_dir at it. Grids
+            are matched by glob, since the Dryad readme names them
+            vegtype_YYYY.tif but the archive ships CONUS_vegtype_YYYY_48sec.tif.
 """
 
 from __future__ import annotations   # anaconda env here is Python 3.9
@@ -53,22 +47,17 @@ import rasterio
 from rasterio.windows import Window
 from tqdm import tqdm
 
-HLNID_LULC_DIR = "HLNID_48sec/lulc"
+HLNID_LULC_DIR = "HLNID_48sec_20260406/lulc"
+VEGTYPE_GLOB = "*vegtype_*.tif"
+PREFIX = "HLNID_"
 
 M_PER_DEG = 111_320.0
-
 HLNID_YEAR_MIN, HLNID_YEAR_MAX = 1938, 2020
-
-# Radius floor applied to every sample; those with a larger location
-# uncertainty are read over that instead. Kept identical to the HILDA+ pipeline
-# so the two sets of columns describe the same circle.
-SAMPLING_RADIUS_M = 5_000.0
 
 # Codes and names exactly as the HLNID readme gives them. Forest is split by
 # leaf habit rather than collapsed as in the HILDA+ pipeline: here the division
 # comes from NLCD/LCMAP/FORE-SCE for the year in question, not carried forward
-# from a single reference year, so it is an observation and belongs in the
-# diversity index.
+# from a single reference year.
 HLNID_CLASSES = {
     4: "Evergreen forest",
     5: "Deciduous forest",
@@ -94,29 +83,23 @@ HLNID_CLASSES = {
 }
 CLASS_ORDER = list(HLNID_CLASSES.values())
 
-# 0 is the off-CONUS background. Any raster-declared nodata is added to this at
-# read time.
+# 0 is the off-CONUS background; any raster-declared nodata is added at read time.
 NODATA_CODES = (0,)
-
-# Below this cell count the Shannon index is returned as NaN. The 5 km floor
-# clears it for any sample inside CONUS, so it only bites on the border.
-MIN_CELLS_FOR_SHANNON = 2
 
 
 def _slug(name: str) -> str:
-    """Column-safe form of a class name: 'Pasture / range' -> 'pasture_range'."""
-    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    """'Pasture / range' -> 'HLNID_pct_pasture_range'."""
+    return PREFIX + "pct_" + re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 
-PCT_COLUMNS = [f"pct_{_slug(c)}" for c in CLASS_ORDER]
+PCT_COLUMNS = [_slug(c) for c in CLASS_ORDER]
 
 
 def find_lulc_dir(lulc_dir: str | Path = HLNID_LULC_DIR) -> Path:
     """
-    Locate the directory holding vegtype_YYYY.tif.
-
-    Accepts the lulc directory itself or any parent of it, so an archive that
-    unzips to a wrapper folder does not need to be rearranged by hand.
+    Locate the directory holding the annual vegtype rasters. Accepts that
+    directory or any parent of it, so the wrapper folder the archive unzips to
+    is fine.
     """
     root = Path(lulc_dir)
     if not root.exists():
@@ -125,12 +108,12 @@ def find_lulc_dir(lulc_dir: str | Path = HLNID_LULC_DIR) -> Path:
             "HLNID_48sec_20260406.zip from https://doi.org/10.5061/dryad.r4xgxd2rh "
             "and unzip it beside this script."
         )
-    if any(root.glob("vegtype_*.tif")):
+    if any(root.glob(VEGTYPE_GLOB)):
         return root
 
-    hits = sorted({p.parent for p in root.rglob("vegtype_*.tif")})
+    hits = sorted({p.parent for p in root.rglob(VEGTYPE_GLOB)})
     if not hits:
-        raise FileNotFoundError(f"no vegtype_YYYY.tif found under {root}")
+        raise FileNotFoundError(f"no {VEGTYPE_GLOB} found under {root}")
     if len(hits) > 1:
         raise ValueError(
             f"several vegtype directories under {root} ({', '.join(map(str, hits))}); "
@@ -142,11 +125,10 @@ def find_lulc_dir(lulc_dir: str | Path = HLNID_LULC_DIR) -> Path:
 def resolve_radius(
     df: pd.DataFrame,
     radius_col: Optional[str] = None,
-    min_radius_m: float = SAMPLING_RADIUS_M,
 ) -> pd.Series:
     """
-    Sampling radius in metres per sample: location uncertainty raised to
-    min_radius_m. Pass min_radius_m=0.0 to use the uncertainty alone.
+    Location uncertainty in metres per sample. A missing uncertainty becomes 0,
+    which reads the single cell containing the coordinate.
     """
     if radius_col is not None:
         radius = pd.to_numeric(df[radius_col], errors="coerce")
@@ -166,17 +148,14 @@ def resolve_radius(
             "first to produce lat_precision_m / lon_precision_m"
         )
 
-    return radius.fillna(0.0).clip(lower=min_radius_m)
+    return radius.fillna(0.0).clip(lower=0.0)
 
 
 class _Grid:
     """
-    Geometry of one HLNID raster, read from the file rather than hardcoded.
-
-    HLNID ships at two resolutions and the pipeline should not care which it is
-    handed, so cell size and origin come from the GeoTIFF's own transform. The
-    circle maths below works in degrees, so a projected raster is rejected
-    instead of being silently mis-sampled.
+    Geometry of one HLNID raster, read from the file rather than hardcoded so
+    either resolution works. The circle maths below is in degrees, so a
+    projected raster is rejected instead of being silently mis-sampled.
     """
 
     def __init__(self, src: rasterio.DatasetReader):
@@ -212,13 +191,12 @@ def _read_circle(
     radius_m: float,
 ) -> np.ndarray:
     """
-    Class codes (nodata not yet removed) for the cells whose centres lie within
-    radius_m of a point. Empty if the circle misses the raster entirely.
+    Class codes (nodata not yet removed) for cells whose centres lie within
+    radius_m of a point, or the single cell containing the point when the
+    radius is sub-cell. Empty if the point is off the raster.
 
     Distances are computed in index space with a cos(latitude) correction; at
-    these radii the flat-earth approximation is well inside the cell size. A
-    sub-cell radius leaves no centre inside and falls back to the single cell
-    containing the point, which cannot happen under the default floor.
+    these radii the flat-earth approximation is well inside the cell size.
     """
     row, col = grid.cell_index(lat, lon)
     m_per_deg_lon = M_PER_DEG * math.cos(math.radians(lat))
@@ -249,14 +227,10 @@ def _read_circle(
     return np.array([block[row - r0, col - c0]], dtype=block.dtype)
 
 
-def _composition(
-    codes: np.ndarray,
-    nodata_codes: tuple,
-    min_cells_for_shannon: int,
-) -> Optional[dict]:
+def _composition(codes: np.ndarray, nodata_codes: tuple) -> Optional[dict]:
     """
-    Turn raw class codes into percentages, a majority class, and a Shannon
-    index. None if every cell was nodata.
+    Class codes to percentages, a majority class and a cell count. None if
+    every cell was nodata.
     """
     if codes.size == 0:
         return None
@@ -270,19 +244,13 @@ def _composition(
 
     counts = names.value_counts()
     total = float(counts.sum())
-    shares = counts / total
 
     out = {col: 0.0 for col in PCT_COLUMNS}
-    for cls, share in shares.items():
-        out[f"pct_{_slug(cls)}"] = share * 100.0
+    for cls, share in (counts / total).items():
+        out[_slug(cls)] = share * 100.0
 
-    out["hlnid_majority_class"] = counts.idxmax()
-    out["hlnid_n_cells"] = int(total)
-    # + 0.0 turns the -0.0 of a single-class circle into 0.0.
-    out["hlnid_shannon"] = (
-        float(-(shares * np.log(shares)).sum()) + 0.0
-        if total >= min_cells_for_shannon else np.nan
-    )
+    out[PREFIX + "majority_class"] = counts.idxmax()
+    out[PREFIX + "n_cells"] = int(total)
     return out
 
 
@@ -293,19 +261,17 @@ def collect_hlnid_data(
     lat_col: str = "decimalLatitude",
     lon_col: str = "decimalLongitude",
     radius_col: Optional[str] = None,
-    min_radius_m: float = SAMPLING_RADIUS_M,
-    min_cells_for_shannon: int = MIN_CELLS_FOR_SHANNON,
     checkpoint_dir: str = "hlnid_checkpoints",
 ) -> pd.DataFrame:
     """
     Match annual HLNID LULC to samples by location and collection year, reading
-    each over a circle of max(location uncertainty, min_radius_m). Returns a
-    copy of df with the composition columns joined on.
+    each over its own location uncertainty. Returns a copy of df with the
+    HLNID_ columns joined on.
 
     Loops years on the outside so each annual GeoTIFF is opened once. Finished
-    years are checkpointed and an interrupted run resumes. Only years present in
-    the sample table are read, and samples collected outside 1938-2020 are left
-    as NaN rather than filled from the nearest available year.
+    years are checkpointed and an interrupted run resumes. Samples collected
+    outside 1938-2020 are left as NaN rather than filled from the nearest
+    available year.
     """
     lulc = find_lulc_dir(lulc_dir)
 
@@ -313,35 +279,37 @@ def collect_hlnid_data(
     lat = pd.to_numeric(work[lat_col], errors="coerce")
     lon = pd.to_numeric(work[lon_col], errors="coerce")
     year = pd.to_numeric(work[year_col], errors="coerce")
-    radius = resolve_radius(work, radius_col, min_radius_m)
+    radius = resolve_radius(work, radius_col)
 
     has_input = lat.notna() & lon.notna() & year.notna()
     in_range = year.between(HLNID_YEAR_MIN, HLNID_YEAR_MAX)
     usable = has_input & in_range
 
-    # Checkpoints are only valid for the radius floor and the grid they were
-    # written under, so they are kept per floor per resolution rather than
-    # silently reused after a change.
-    ckpt = Path(checkpoint_dir) / f"{lulc.parent.name}_floor_{int(round(min_radius_m))}m"
+    # Checkpoints are only valid for the grid they were written under, so they
+    # are kept per resolution rather than silently reused.
+    ckpt = Path(checkpoint_dir) / lulc.parent.name
     ckpt.mkdir(parents=True, exist_ok=True)
 
     frames = []
-    years = sorted(year[usable].unique())
-
-    for yr in tqdm(years, desc="years", unit="yr"):
+    for yr in tqdm(sorted(year[usable].unique()), desc="years", unit="yr"):
         ckpt_file = ckpt / f"{int(yr)}.csv"
         if ckpt_file.exists():
             frames.append(pd.read_csv(ckpt_file, index_col=0))
             continue
 
-        tif = lulc / f"vegtype_{int(yr)}.tif"
-        if not tif.exists():
+        matches = sorted(lulc.glob(f"*vegtype_{int(yr)}_*.tif")) or \
+            sorted(lulc.glob(f"*vegtype_{int(yr)}.tif"))
+        if not matches:
             raise FileNotFoundError(
-                f"{tif} missing: year {int(yr)} is inside "
+                f"no vegtype raster for {int(yr)} in {lulc}: the year is inside "
                 f"{HLNID_YEAR_MIN}-{HLNID_YEAR_MAX} but the file is not there"
             )
-
-        group = work.index[usable & (year == yr)]
+        if len(matches) > 1:
+            raise ValueError(
+                f"several vegtype rasters for {int(yr)} in {lulc}: "
+                f"{', '.join(p.name for p in matches)}"
+            )
+        tif = matches[0]
 
         rows = {}
         with rasterio.open(tif) as src:
@@ -349,24 +317,20 @@ def collect_hlnid_data(
             nodata = NODATA_CODES if src.nodata is None else (
                 tuple(NODATA_CODES) + (int(src.nodata),))
 
-            for idx in group:
-                codes = _read_circle(
-                    src, grid, float(lat[idx]), float(lon[idx]), float(radius[idx])
+            for idx in work.index[usable & (year == yr)]:
+                comp = _composition(
+                    _read_circle(src, grid, float(lat[idx]), float(lon[idx]),
+                                 float(radius[idx])),
+                    nodata,
                 )
-                comp = _composition(codes, nodata, min_cells_for_shannon)
                 if comp is None:
                     continue
 
                 prow, pcol = grid.cell_index(float(lat[idx]), float(lon[idx]))
-                if grid.contains(prow, pcol):
-                    point_code = int(src.read(1, window=Window(pcol, prow, 1, 1))[0, 0])
-                    comp["hlnid_point_class"] = HLNID_CLASSES.get(point_code)
-                else:
-                    comp["hlnid_point_class"] = None
-                comp["hlnid_radius_m"] = float(radius[idx])
-                comp["hlnid_radius_source"] = (
-                    "uncertainty" if float(radius[idx]) > min_radius_m else "floor"
-                )
+                point_code = (int(src.read(1, window=Window(pcol, prow, 1, 1))[0, 0])
+                              if grid.contains(prow, pcol) else None)
+                comp[PREFIX + "point_class"] = HLNID_CLASSES.get(point_code)
+                comp[PREFIX + "radius_m"] = float(radius[idx])
                 rows[idx] = comp
 
         out = pd.DataFrame.from_dict(rows, orient="index")
@@ -386,12 +350,13 @@ def _report_coverage(
     in_range: pd.Series,
 ) -> None:
     """Print how many samples got land use data, and why the rest did not."""
-    have = (df["hlnid_n_cells"].notna() if "hlnid_n_cells" in df
+    n_cells_col = PREFIX + "n_cells"
+    have = (df[n_cells_col].notna() if n_cells_col in df
             else pd.Series(False, index=df.index))
     no_input = ~has_input
     outside = has_input & ~in_range
-    # HLNID is CONUS only, so off-CONUS samples land here rather than in a
-    # category of their own: outside the mapped area reads as background.
+    # HLNID is CONUS only, so off-CONUS samples land here: outside the mapped
+    # area reads as background.
     no_value = ~have & has_input & in_range
 
     print("\n--- HLNID coverage ---")
@@ -403,19 +368,18 @@ def _report_coverage(
     print(f"  - collected outside "
           f"{HLNID_YEAR_MIN}-{HLNID_YEAR_MAX}: {int(outside.sum())}")
     print(f"  - outside CONUS / background:  {int(no_value.sum())}")
-    if "hlnid_n_cells" in df:
-        n = pd.to_numeric(df["hlnid_n_cells"], errors="coerce")
+
+    if n_cells_col in df:
+        n = pd.to_numeric(df[n_cells_col], errors="coerce")
         print(f"cells per sample:                median {n.median():.0f}, "
-              f"min {n.min():.0f}, max {n.max():.0f}")
-    if "hlnid_radius_m" in df:
-        r = pd.to_numeric(df["hlnid_radius_m"], errors="coerce") / 1000.0
-        above = int((df["hlnid_radius_source"] == "uncertainty").sum())
-        print(f"radius per sample (km):          median {r.median():.1f}, "
-              f"max {r.max():.1f} ({above} above the floor)")
-    if "hlnid_majority_class" in df:
-        top = df["hlnid_majority_class"].value_counts()
+              f"max {n.max():.0f}   ({int((n == 1).sum())} read as a single cell)")
+    if PREFIX + "radius_m" in df:
+        r = pd.to_numeric(df[PREFIX + "radius_m"], errors="coerce")
+        print(f"uncertainty radius (m):          median {r.median():.0f}, "
+              f"max {r.max():.0f}")
+    if PREFIX + "majority_class" in df:
         print("majority class:")
-        for cls, n in top.items():
+        for cls, n in df[PREFIX + "majority_class"].value_counts().items():
             print(f"  {cls:<30} {n}")
 
 

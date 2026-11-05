@@ -8,10 +8,16 @@ samples, by site of action group, for the year each sample was collected.
 
 Methodology: Assign each sample to the US county containing its coordinate,
 then join the USGS EPest county-year estimates for that county. Compound
-estimates are summed into HRAC site-of-action groups, which are the unit
-resistance alleles map onto. Each group is reported both as raw kg applied and
-as kg per hectare of county cropland; only the latter is comparable between
-samples, since raw kg tracks how much cropland a county happens to have.
+estimates are summed into mode-of-action groups, which are the unit resistance
+alleles map onto. Each group is reported both as raw kg applied and as kg per
+hectare of county cropland; only the latter is comparable between samples,
+since raw kg tracks how much cropland a county happens to have.
+
+Groups are the full mode-of-action labels used in
+herbarium_herbicide_groups_metadata.csv, not bare HRAC numbers, so the two
+tables name the same things. That keeps chemistry the numbers would merge
+apart: the three ACCase subgroups, the six PS II Group 5 subclasses, the five
+VLCFA subclasses, and glyphosate separate from the other EPSPS compounds.
 
 EPest estimates agricultural use only, allocated to counties from surveyed crop
 acreage. A zero therefore means no estimated use on crops, not that nothing was
@@ -23,7 +29,9 @@ cannot have been applied before it existed, so a sample collected before a
 group's first US registration is a true zero rather than a gap. Those rows are
 written as 0.0 and flagged; samples between a group's registration and 1992,
 and samples after 2018, are left NaN. The registration years below are
-deliberately rounded down, so a zero is only ever claimed when it is safe.
+deliberately rounded down, so a zero is only ever claimed when it is safe. A
+label inherits the first year of the HRAC number it names, which stays
+conservative when a label is narrower than its group.
 
 Sample status is summarized in hb_status, and the per-group zero-versus-NaN
 distinction is what separates "known absent" from "unknown".
@@ -262,6 +270,9 @@ GROUP_FIRST_YEAR = {
     29: 2010,   # cellulose, indaziflam
 }
 
+# Labels whose HRAC number cannot be read off the label text.
+LABEL_GROUP_OVERRIDE = {"GLYPHOSATE": (9,)}
+
 # EPest reports a low and a high estimate; they differ where survey coverage is
 # thin. "high" matches the older script's default.
 VALUE_KINDS = ("high", "low", "mean")
@@ -269,20 +280,34 @@ VALUE_KINDS = ("high", "low", "mean")
 HILDA_CROPLAND_CODE = 22
 
 
-def compound_to_group(moa: str, compound: str) -> Optional[int]:
+def group_numbers(moa: str) -> tuple:
     """
-    HRAC group number for a compound, parsed from its mode-of-action label.
+    HRAC group number(s) named in a mode-of-action label.
 
-    Glyphosate is group 9 but is labelled only "GLYPHOSATE" in the MOA table
-    inherited from add_herbicide_metadata.py, and bromoxynil is labelled with a
-    dual "6/24"; both are resolved here rather than by the regex.
+    "GLYPHOSATE" carries no number in the MOA table inherited from
+    add_herbicide_metadata.py, so its group is supplied here. A dual-mode label
+    such as "(Group 6/24)" yields both numbers.
     """
-    if compound == "GLYPHOSATE":
-        return 9
-    if compound == "BROMOXYNIL":
-        return 6
-    match = re.search(r"Group (\d+)", str(moa))
-    return int(match.group(1)) if match else None
+    if moa in LABEL_GROUP_OVERRIDE:
+        return LABEL_GROUP_OVERRIDE[moa]
+    return tuple(int(n) for n in re.findall(r"\d+", str(moa)))
+
+
+def moa_first_year(moa: str) -> Optional[int]:
+    """
+    Earliest US registration among the HRAC groups a label names, or None when
+    the label names no known group.
+
+    Taking the minimum keeps the pre-introduction zeros safe twice over: a
+    dual-mode label gets the earlier of its two groups, and a label narrower
+    than its group (say the DEN subgroup of ACCase) inherits the whole group's
+    first year rather than its own later one. Both err toward claiming fewer
+    zeros. Refining these per subclass would let more pre-1992 samples be
+    called, but needs a registration date per subclass that this table does
+    not have.
+    """
+    years = [GROUP_FIRST_YEAR[n] for n in group_numbers(moa) if n in GROUP_FIRST_YEAR]
+    return min(years) if years else None
 
 
 def epest_path(year: int, cache_dir: Path) -> Path:
@@ -321,7 +346,7 @@ def load_epest_year(
     cache_dir: Path,
 ) -> pd.DataFrame:
     """
-    One EPest year as tidy rows of (fips, group, kg), summed within group.
+    One EPest year as tidy rows of (fips, moa, kg), summed within MOA label.
 
     Compounds with no mode of action in moa_by_compound are dropped; that table
     covers herbicides only, so this is what excludes insecticides and fungicides.
@@ -345,13 +370,12 @@ def load_epest_year(
     out = pd.DataFrame({
         "fips": (table["STATE_FIPS_CODE"].str.zfill(2)
                  + table["COUNTY_FIPS_CODE"].str.zfill(3)),
-        "group": [compound_to_group(m, c) for m, c in zip(moa, compound)],
+        "moa": moa,
         "kg": kg,
     })
-    out = out[out["group"].notna() & moa.notna()]
-    out["group"] = out["group"].astype(int)
+    out = out[out["moa"].notna()]
 
-    return (out.groupby(["fips", "group"], as_index=False)["kg"]
+    return (out.groupby(["fips", "moa"], as_index=False)["kg"]
             .sum(min_count=1))
 
 
@@ -475,12 +499,15 @@ def add_herbicide_metadata(
     with_cropland: bool = True,
 ) -> pd.DataFrame:
     """
-    Join EPest county-year herbicide estimates to a sample table by HRAC group.
+    Join EPest county-year herbicide estimates to a sample table by mode of
+    action.
 
-    Returns a copy of df with, per group, hb_kg_grpN and (where the cropland
-    denominator is available) hb_kgha_grpN, plus hb_fips, hb_status and
-    hb_n_groups_pre_introduction. A 0.0 means the group did not yet exist when
-    the sample was collected; NaN means its use is unknown for that sample.
+    Returns a copy of df with, per group, "hb_kg_<label>" and (where the
+    cropland denominator is available) "hb_kgha_<label>", plus hb_fips,
+    hb_status and hb_n_groups_pre_introduction. <label> is the mode-of-action
+    name exactly as herbarium_herbicide_groups_metadata.csv spells it. A 0.0
+    means the group did not yet exist when the sample was collected; NaN means
+    its use is unknown for that sample.
     """
     if value_kind not in VALUE_KINDS:
         raise ValueError(f"value_kind must be one of {VALUE_KINDS}")
@@ -501,38 +528,40 @@ def add_herbicide_metadata(
          for yr in tqdm(sorted(year[joinable].unique()), desc="EPest years",
                         unit="yr")],
         ignore_index=True,
-    ) if joinable.any() else pd.DataFrame(columns=["fips", "group", "kg", "year"])
+    ) if joinable.any() else pd.DataFrame(columns=["fips", "moa", "kg", "year"])
 
-    groups = sorted(set(tall["group"]) | set(GROUP_FIRST_YEAR))
-    kg_cols = {g: f"hb_kg_grp{g}" for g in groups}
+    # Every label the MOA table knows, whether or not it turned up in the years
+    # actually read, so the column set does not shift with the sample table.
+    labels = sorted(set(tall["moa"]) | set(moa_by_compound.values()))
+    kg_cols = {m: f"hb_kg_{m}" for m in labels}
 
-    wide = (tall.pivot_table(index=["year", "fips"], columns="group",
+    wide = (tall.pivot_table(index=["year", "fips"], columns="moa",
                              values="kg", aggfunc="sum")
             if not tall.empty else pd.DataFrame())
 
     # Rows that joined get their county's value, with an absent group meaning
     # zero kg applied there that year rather than missing.
-    for g in groups:
-        work[kg_cols[g]] = np.nan
+    for m in labels:
+        work[kg_cols[m]] = np.nan
     if not wide.empty:
         keys = pd.MultiIndex.from_arrays([year[joinable], fips[joinable]])
         matched = wide.reindex(keys)
-        for g in groups:
-            if g in wide.columns:
-                work.loc[joinable, kg_cols[g]] = matched[g].fillna(0.0).values
+        for m in labels:
+            if m in wide.columns:
+                work.loc[joinable, kg_cols[m]] = matched[m].fillna(0.0).values
             else:
-                work.loc[joinable, kg_cols[g]] = 0.0
+                work.loc[joinable, kg_cols[m]] = 0.0
 
     # Outside the window, a group that did not yet exist is a true zero. This
     # applies regardless of whether the sample is in the US.
-    pre_intro = pd.DataFrame(False, index=work.index, columns=groups)
-    for g in groups:
-        first = GROUP_FIRST_YEAR.get(g)
+    pre_intro = pd.DataFrame(False, index=work.index, columns=labels)
+    for m in labels:
+        first = moa_first_year(m)
         if first is None:
             continue
         before = year.notna() & (year < first) & ~joinable
-        work.loc[before, kg_cols[g]] = 0.0
-        pre_intro[g] = before
+        work.loc[before, kg_cols[m]] = 0.0
+        pre_intro[m] = before
 
     cropland = pd.Series(dtype=float)
     if with_cropland and joinable.any():
@@ -548,15 +577,15 @@ def add_herbicide_metadata(
     ]
     # A county with no HILDA cropland cells has no denominator, so intensity is
     # left NaN rather than becoming inf.
-    for g in groups:
+    for m in labels:
         with np.errstate(invalid="ignore", divide="ignore"):
-            intensity = work[kg_cols[g]] / work["hb_cropland_ha"]
-        work[f"hb_kgha_grp{g}"] = intensity.replace([np.inf, -np.inf], np.nan)
+            intensity = work[kg_cols[m]] / work["hb_cropland_ha"]
+        work[f"hb_kgha_{m}"] = intensity.replace([np.inf, -np.inf], np.nan)
 
     work["hb_n_groups_pre_introduction"] = pre_intro.sum(axis=1)
     work["hb_status"] = _status(year, fips, joinable)
 
-    _report_coverage(work, year, fips, groups)
+    _report_coverage(work, year, fips, labels)
     return work
 
 
@@ -575,17 +604,18 @@ def _report_coverage(
     df: pd.DataFrame,
     year: pd.Series,
     fips: pd.Series,
-    groups: list,
+    labels: list,
 ) -> None:
     """Print where the herbicide values came from, and what is still unknown."""
     counts = df["hb_status"].value_counts()
-    kg_cols = [f"hb_kg_grp{g}" for g in groups]
+    kg_cols = [f"hb_kg_{m}" for m in labels]
     measured = df["hb_status"] == "epest"
     zeros_only = ~measured & df[kg_cols].notna().any(axis=1)
     nothing = ~measured & ~zeros_only
 
     print("\n--- EPest coverage ---")
     print(f"total samples:                   {len(df)}")
+    print(f"mode-of-action groups:           {len(labels)}")
     print(f"  measured use from EPest:       {int(measured.sum())}")
     print(f"  pre-introduction zeros only:   {int(zeros_only.sum())}")
     print(f"  no herbicide value:            {int(nothing.sum())}")
@@ -596,7 +626,7 @@ def _report_coverage(
     if zeros_only.any():
         n = df.loc[zeros_only, "hb_n_groups_pre_introduction"]
         print(f"groups known absent, those rows:  median {n.median():.0f} "
-              f"of {len(groups)}")
+              f"of {len(labels)}")
     print(f"counties matched:                {int(fips.nunique())}")
     if df["hb_cropland_ha"].notna().any():
         ha = df["hb_cropland_ha"]
@@ -613,3 +643,4 @@ if __name__ == "__main__":
 
     ##Pull the new landuse, iron out herbicide, and pull climate NA.
     #also flag the samples with extrememe uncertainty errors
+    ## disagreement between hlnid and hilda+ on cropland and other categories
