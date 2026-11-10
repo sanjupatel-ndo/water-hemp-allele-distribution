@@ -294,7 +294,11 @@ def _report_coverage(df: pd.DataFrame, variables: list[str]) -> None:
  
  
 if __name__ == "__main__":
-    df = pd.read_csv("herbarium_metadata_2022_2026_datasets.csv")
+    df = pd.read_csv("herbarium_samples_ALL.csv", low_memory=False)
+    owned = set(ALL_VARIABLES) | {f"{v}_std" for v in ALL_VARIABLES}
+    df = df.drop(columns=[c for c in df.columns
+                          if c in owned or c.startswith("prism_")])
+
     gdf = create_buffers(df)
  
     result = collect_prism_data(
@@ -304,4 +308,4 @@ if __name__ == "__main__":
         month_col="month",
         uncertainty_col="coordinateUncertaintyInMeters",
     )
-    result.drop(columns=["geometry", "uncertainty_buffer"]).to_csv("herbarium_samples_2022_2026_withPRISMvars.csv", index=False)
+    result.drop(columns=["geometry", "uncertainty_buffer"]).to_csv("herbarium_samples_ALL.csv", index=False)

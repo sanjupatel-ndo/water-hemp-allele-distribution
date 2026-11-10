@@ -333,7 +333,9 @@ def _report_coverage(
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("herbarium_metadata_2022_2026_datasets.csv", low_memory=False)
+    df = pd.read_csv("herbarium_samples_ALL.csv", low_memory=False)
+    df = df.drop(columns=[c for c in df.columns
+                          if c.startswith(("pct_", "hilda_"))])
 
     result = collect_hilda_data(
         df,
@@ -341,5 +343,5 @@ if __name__ == "__main__":
         lat_col="decimalLatitude",
         lon_col="decimalLongitude",
     )
-    result.to_csv("herbarium_samples_withHILDA.csv", index=False)
+    result.to_csv("herbarium_samples_ALL.csv", index=False)
 

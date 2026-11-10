@@ -635,11 +635,12 @@ def _report_coverage(
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("herbarium_samples_withHILDA.csv", low_memory=False)
+    df = pd.read_csv("herbarium_samples_ALL.csv", low_memory=False)
+    df = df.drop(columns=[c for c in df.columns if c.startswith("hb_")])
 
     result = add_herbicide_metadata(df)
-    result.to_csv("herbarium_samples_withHERBICIDE.csv", index=False)
-    print("\nWrote herbarium_samples_withHERBICIDE.csv")
+    result.to_csv("herbarium_samples_ALL.csv", index=False)
+    print("\nWrote herbarium_samples_ALL.csv")
 
     ##Pull the new landuse, iron out herbicide, and pull climate NA.
     #also flag the samples with extrememe uncertainty errors
