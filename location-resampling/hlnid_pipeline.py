@@ -6,22 +6,14 @@ Primary contributor(s): Sanju Patel
 Objective: Pull land use / land cover and crop type for samples with varying
 degrees of location uncertainty, at a resolution that resolves individual crops.
 
-Methodology: Mirrors land_use_pipeline.py. For each sample, read every HLNID
-LULC cell whose centre falls within 5 km of the recorded coordinate, or within
-the sample's own location uncertainty where that is wider. Report the class
-composition of those cells, the class at the point itself, and a Shannon index
-for the diversity of land uses.
-
-The 5 km floor is a sampling choice, not an uncertainty claim: at 48 arc-sec a
-tight radius returns one or two cells, too few to describe a composition, while
-5 km gives 45-50. The radius used is reported per sample in HLNID_radius_m and
-HLNID_radius_source.
+Methodology: For each sample, pull the land use designations for a 5km buffer
+or the sample radius of uncertainty, whichever is larger. Report land use
+proportions as percentages.
 
 HLNID against HILDA+: HLNID separates the crops waterhemp grows in (Corn,
 Soybean, Small grains, Alfalfa, Non-alfalfa hay, Other crop) where HILDA+
 collapses them into one Cropland class, and splits developed land into four
-intensities. The cost is coverage: HLNID is conterminous US only and starts in
-1938, so Ontario and pre-1938 samples are NaN here. The two are complementary.
+intensities. 
 
 Classes are reported under their exact HLNID names, with no grouping into
 agricultural and non-agricultural.

@@ -4,68 +4,34 @@
 #Primary contributor(s): Sanju Patel
 #
 #Objective: Pull environmental data for samples with varying degrees of location
-#uncertainty, for the same variable categories as PRISM-pipeline.py, from
-#ClimateNA instead of PRISM.
+#uncertainty. ClimateNA doesn't use cells so pulling data at 800m points is 
+#an arbitray decision.
 #
-#Methodology: Mirrors PRISM-pipeline.py. For each sample, draw a circle where
-#the sample may have been collected, read every point in that circle, and report
-#the mean and standard deviation of the sampling distribution for each variable,
-#for the sample's collection month. Samples whose uncertainty is within one
-#PRISM cell (800 m) are read at the point itself, as in that pipeline.
+#Methodology: For each sample, draw a circle based on the sample location
+#uncertainty. Within the uncertainty circle, create a lattice with lines spaced
+#800m apart. For each variable, collect data from every 800m x 800m square and 
+#report the mean and standard deviation of the collected data (up to 100 squares
+#per point). If the uncertainty is less than 800m, just report the value at the 
+#point.
 #
-#ClimateNA is scale-free rather than gridded: it returns a value for a
-#coordinate, not a cell. There are no cells to enumerate inside a circle, so the
-#circle is sampled on an 800 m lattice -- the PRISM cell size, so the two
-#pipelines average over comparable footprints -- thinned to MAX_POINTS where a
-#wide circle would otherwise hold thousands. cna_n_points records how many
-#points a row actually got, against prism_n_cells for the same sample.
-#
-#How ClimateNA is pulled, and why this way. Three routes exist:
-#  1. The desktop program, driven from R with system2(). Command-line support
-#     starts at v7.20 and the program is Windows-only; the copy in this repo is
-#     v6.40a, which is GUI-only, and there is no Wine on this machine. The call
-#     would be, from the ClimateNA home directory:
-#         system2("ClimateNA_v7.41.exe",
-#                 args = c("/M", "/Year_2015.ann", "/in.csv", "/out.csv"))
-#     where /Y is annual, /S seasonal, /M monthly and /MSY all.
-#  2. The web API at api.climatena.ca, which ClimateNAr's ClimateNA_API and
-#     ClimateNA_API2 wrap. It needs no key and takes 100 points per POST, but
-#     it answers "Too many calls! We can only allow 5 per Hour" after five
-#     requests, so a 738-sample table over 126 collection years is a day of
-#     waiting. Registering at register.climatena.ca may raise that; untested.
-#  3. The ClimateNAr R package (v3.2.0, Tongli Wang), which is what this
-#     pipeline uses. It carries a native R implementation of ClimateNA plus the
-#     1901-2025 historical data, so it runs locally with no executable, no key
-#     and no rate limit, and one call covers every point of one year.
-#
-#Elevation is required, and it is the one real cost of this route. ClimateNA
-#downscales by local elevation adjustment and takes elevation as the fifth input
-#column, so every sampled point needs one. The herbarium table has no elevation
-#column, so points are looked up against SRTM 30 m through OpenTopoData and
-#cached. That service, not ClimateNA, is what sets MAX_POINTS: it allows 100
-#locations per call and 1,000 calls a day, so 100 points per sample keeps the
-#whole table inside one day's budget. Supply an elevation column, or point
-#ELEV_API at your own service, to lift that.
 #
 #Data requirements:
-#   Inputs: Waterhemp samples with a latitude, longitude, collection year,
-#           collection month and an uncertainty radius, in
-#           herbarium_samples_ALL.csv.
+#   Inputs: Waterhemp samples with a latitude, longitude, elevation, collection
+#           year, collection month and an uncertainty radius. Elevation comes 
+#           from elevation_pipeline.py; points without one are skipped.
 #   Package: ClimateNAr 3.2.0, from https://climatena.ca/downloads/ClimateNAr.zip
-#           (187 MB), unzipped into an R library. It imports terra, readr and
-#           data.table, and verifies its version against climatena.ca on each
-#           call, so the first call of a session needs the network.
-#   Network: api.opentopodata.org for elevation, cached under climatena_cache/.
+#           (187 MB), unzipped into an R library. It carries a native R
+#           implementation of ClimateNA plus the 1901-2025 historical data, so
+#           it runs locally with no executable, key or rate limit. It imports
+#           terra, readr and data.table, and verifies its version against
+#           climatena.ca on each call, so the first call of a session needs the
+#           network.
 #   Coverage: North America, 1901-2025. Samples outside that window, or without
 #           a collection month, are left as NA rather than filled from the
 #           nearest year.
 #######
 
-library(httr)
-library(jsonlite)
 library(ClimateNAr)
-
-ELEV_API <- "https://api.opentopodata.org/v1/srtm30m"
 
 M_PER_DEG <- 111320
 CNA_YEAR_MIN <- 1901
@@ -77,11 +43,10 @@ CNA_NODATA <- -9999            # what ClimateNA returns outside its coverage
 POINT_RADIUS_M <- 800
 
 # The circle is sampled on a lattice of this spacing, thinned to at most
-# MAX_POINTS. See the elevation note in the header for where 100 comes from.
+# MAX_POINTS, which a 10 km circle would otherwise overshoot by two orders of
+# magnitude for no gain in the mean.
 POINT_SPACING_M <- 800
 MAX_POINTS <- 100
-ELEV_BATCH <- 100
-PAUSE <- 1.0                   # seconds between elevation calls
 
 # PRISM variable -> the ClimateNA monthly family holding the same quantity.
 # ClimateNA has no dewpoint or vapour pressure deficit; it reports relative
@@ -128,57 +93,6 @@ circle_points <- function(lat, lon, radius_m,
   m_per_deg_lon <- M_PER_DEG * cos(lat * pi / 180)
   data.frame(lat = lat + grid$dy / M_PER_DEG,
              lon = lon + grid$dx / max(m_per_deg_lon, 1e-6))
-}
-
-
-# --------------------------------------------------------------------------
-# Elevation
-# --------------------------------------------------------------------------
-fetch_elevations <- function(pts, cache_file = "climatena_cache/elevations.csv",
-                             pause = PAUSE, retries = 4) {
-  # Elevation in metres for a data frame of lat/lon, from SRTM 30 m. Results
-  # are cached on rounded coordinates, which is also how repeated points across
-  # samples and years collapse to one lookup.
-  key <- paste(round(pts$lat, 6), round(pts$lon, 6), sep = ",")
-  cache <- if (file.exists(cache_file)) {
-    read.csv(cache_file, stringsAsFactors = FALSE)
-  } else {
-    data.frame(key = character(0), elev = numeric(0), stringsAsFactors = FALSE)
-  }
-
-  missing <- setdiff(unique(key), cache$key)
-  if (length(missing) > 0) {
-    dir.create(dirname(cache_file), showWarnings = FALSE, recursive = TRUE)
-    found <- data.frame(key = character(0), elev = numeric(0),
-                        stringsAsFactors = FALSE)
-
-    for (start in seq(1, length(missing), by = ELEV_BATCH)) {
-      chunk <- missing[start:min(start + ELEV_BATCH - 1, length(missing))]
-      elev <- rep(NA_real_, length(chunk))
-
-      for (attempt in seq_len(retries)) {
-        response <- try(GET(ELEV_API,
-                            query = list(locations = paste(chunk, collapse = "|")),
-                            timeout(180)), silent = TRUE)
-        if (!inherits(response, "try-error") && status_code(response) == 200) {
-          parsed <- fromJSON(content(response, as = "text", encoding = "UTF-8"))
-          elev <- as.numeric(parsed$results$elevation)
-          break
-        }
-        message("  elevation: retry ", attempt, "/", retries)
-        Sys.sleep(2^attempt)
-      }
-
-      found <- rbind(found, data.frame(key = chunk, elev = elev,
-                                       stringsAsFactors = FALSE))
-      Sys.sleep(pause)           # the public service allows one call a second
-    }
-
-    cache <- rbind(cache, found)
-    write.csv(cache, cache_file, row.names = FALSE)
-  }
-
-  cache$elev[match(key, cache$key)]
 }
 
 
@@ -262,16 +176,15 @@ collect_climatena_data <- function(df,
   # point of that year goes in a single ClimateNAr call. Finished years are
   # checkpointed and an interrupted run resumes. Samples collected outside
   # 1901-2025, or with no collection month, are left as NA.
+  if (!elevation_col %in% names(df)) {
+    stop("no '", elevation_col, "' column -- run elevation_pipeline.py first")
+  }
   lat <- suppressWarnings(as.numeric(df[[lat_col]]))
   lon <- suppressWarnings(as.numeric(df[[lon_col]]))
   year <- suppressWarnings(as.numeric(df[[year_col]]))
   month <- suppressWarnings(as.numeric(df[[month_col]]))
   radius <- suppressWarnings(as.numeric(df[[uncertainty_col]]))
-  elevation <- if (elevation_col %in% names(df)) {
-    suppressWarnings(as.numeric(df[[elevation_col]]))
-  } else {
-    rep(NA_real_, nrow(df))
-  }
+  elevation <- suppressWarnings(as.numeric(df[[elevation_col]]))
 
   has_input <- !is.na(lat) & !is.na(lon) & !is.na(year) & !is.na(month)
   in_range <- !is.na(year) & year >= CNA_YEAR_MIN & year <= CNA_YEAR_MAX
@@ -279,8 +192,7 @@ collect_climatena_data <- function(df,
 
   value_cols <- paste0(PREFIX, c(rbind(ALL_VARIABLES, paste0(ALL_VARIABLES, "_sd"))))
   method_col <- paste0(PREFIX, "method")
-  out_cols <- c(value_cols, paste0(PREFIX, c("n_points", "method", "radius_m",
-                                             "elev_m")))
+  out_cols <- c(value_cols, paste0(PREFIX, c("n_points", "method", "radius_m")))
 
   dir.create(checkpoint_dir, showWarnings = FALSE, recursive = TRUE)
   frames <- list()
@@ -304,10 +216,6 @@ collect_climatena_data <- function(df,
     pts$owner <- rep(group, sizes)
     pts$elev <- rep(elevation[group], sizes)
 
-    unknown <- is.na(pts$elev)
-    if (any(unknown)) {
-      pts$elev[unknown] <- fetch_elevations(pts[unknown, c("lat", "lon")])
-    }
     # ClimateNA adjusts by elevation and has nothing to adjust by without one,
     # so a point the DEM could not place is dropped rather than sent at an
     # invented height.
@@ -350,7 +258,6 @@ collect_climatena_data <- function(df,
       result[k, paste0(PREFIX, "n_points")] <- nrow(values)
       result[k, method_col] <- if (nrow(values) > 1) "area" else "point"
       result[k, paste0(PREFIX, "radius_m")] <- radius[i]
-      result[k, paste0(PREFIX, "elev_m")] <- mean(pts$elev[mine[keep]], na.rm = TRUE)
     }
 
     write.csv(result, checkpoint, row.names = FALSE)
@@ -397,12 +304,6 @@ report_coverage <- function(df, has_input, in_range) {
     cat(sprintf("points per sample:                    median %.0f, max %.0f   (%d read as a single point)\n",
                 median(n, na.rm = TRUE), max(n, na.rm = TRUE),
                 sum(n == 1, na.rm = TRUE)))
-  }
-  elev <- df[[paste0(PREFIX, "elev_m")]]
-  if (any(!is.na(elev))) {
-    cat(sprintf("elevation (m):                        median %.0f, range %.0f to %.0f\n",
-                median(elev, na.rm = TRUE), min(elev, na.rm = TRUE),
-                max(elev, na.rm = TRUE)))
   }
 }
 

@@ -6,19 +6,15 @@ Primary contributor(s): Sanju Patel
 Objective: Pull land use data for samples with varying degrees of location
 uncertainty.
 
-Methodology: For each sample, read every HILDA+ land use/cover cell whose
+Methodology: For each sample, reads every HILDA+ land use/cover cell whose
 centre falls within 5 km of the recorded coordinate, or within the sample's own
-location uncertainty where that is wider. Report the class composition of those
+location uncertainty where that is wider. Reports the class composition of those
 cells, point composition, and a shannon index for the diversity of land uses.
 
-The 5 km floor is a sampling choice, not an uncertainty claim: at 0.01 degree
-resolution a tight radius returns one or two cells, too few to describe a
-composition, while 5 km gives 80-90. The radius used is reported per sample in
-hilda_radius_m and hilda_radius_source.
+The 5 km floor is a sampling choice to enable the shannon index calculations.
+The radius used is reported per sample in hilda_radius_m and hilda_radius_source.
 
-HILDA+ covers 1899-2019 annually and globally, so it reaches the pre-NLCD
-records and the Ontario samples. The cost is resolution: cells are 0.01 degrees,
-about 1.1 km north-south and 850 m east-west at 40 N.
+HILDA+ covers 1899-2019 annually and globally.
 
 Data requirements:
     Inputs: Waterhemp samples with a latitude, longitude, collection year, and
@@ -333,7 +329,7 @@ def _report_coverage(
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("herbarium_samples_ALL.csv", low_memory=False)
+    df = pd.read_csv("herbarium_samples_climateNA.csv", low_memory=False)
     df = df.drop(columns=[c for c in df.columns
                           if c.startswith(("pct_", "hilda_"))])
 
