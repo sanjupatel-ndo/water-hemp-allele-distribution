@@ -5,6 +5,7 @@ Primary contributor(s): Sanju Patel
 
 Objective: Report a location uncertainty for every sample. Additionally,
 check if location data is properly reported and generally prep for resampling.
+For climateNA, attatch an elevation to every sample.
 """
 
 import math
